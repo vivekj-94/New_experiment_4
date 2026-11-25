@@ -1,0 +1,200 @@
+name: Scheduled tests
+
+on:
+  # Runs when manually triggered from the GitHub UI.
+  workflow_dispatch:
+    inputs:
+      slack_test:
+        description: Skip the tests and only send a Slack notification, to check the alerting path.
+        type: boolean
+        default: false
+
+  # Runs on weekdays at 01:00 UTC.
+  schedule:
+    - cron: 0 1 * * 1-5
+
+  # Runs on pull requests that touch the template files, the template e2e tests,
+  # or this workflow itself, so that changes affecting the scheduled tests are
+  # validated before they are merged.
+  pull_request:
+    paths:
+      - src/crawlee/project_template/**
+      - tests/e2e/**
+      - .github/workflows/on_schedule_tests.yaml
+
+concurrency:
+  group: scheduled-tests
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  NODE_VERSION: 24
+  PYTHON_VERSION: 3.14
+  TESTS_CONCURRENCY: 1
+
+jobs:
+  end_to_end_tests:
+    name: End-to-end tests
+    if: github.event_name != 'workflow_dispatch' || !inputs.slack_test
+    # Pull request runs wait for an approval in `e2e-tests-pr`, the scheduled and manual runs on master don't.
+    environment:
+      name: ${{ github.event_name == 'pull_request' && 'e2e-tests-pr' || 'e2e-tests' }}
+      deployment: false
+    strategy:
+      fail-fast: false
+      max-parallel: 12
+      matrix:
+        crawler-type: [playwright_camoufox, playwright_chrome, playwright_firefox, playwright_webkit, playwright, parsel, beautifulsoup, adaptive_beautifulsoup, adaptive_parsel, stagehand]
+        http-client: [httpx, curl_impersonate, impit]
+        package-manager: [pip, uv, poetry]
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7.0.1
+
+      - name: Setup node
+        uses: actions/setup-node@v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install Apify CLI
+        uses: apify/setup-apify-cli-action@v1.1.0
+        with:
+          token: ${{ secrets.APIFY_TEST_USER_API_TOKEN }}
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v7.1.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      # installed to be able to patch crawlee in the poetry.lock with custom wheel file for poetry based templates
+      - name: Install poetry
+        run: pipx install poetry
+
+      - name: Set up uv package manager
+        uses: astral-sh/setup-uv@v10.4.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      # Sync the project, but no need to install the browsers into the test runner environment.
+      - name: Install Python dependencies
+        run: uv run poe install-sync
+
+      - name: Run templates end-to-end tests
+        run: uv run poe e2e-templates-tests -m "${{ matrix.http-client }} and ${{ matrix.crawler-type }} and ${{ matrix.package-manager }}"
+        env:
+          APIFY_TEST_USER_API_TOKEN: ${{ secrets.APIFY_TEST_USER_API_TOKEN }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+
+  # Send a Slack notification to the team alerting channel when scheduled e2e tests fail.
+  # Only scheduled runs notify, so that pull requests and ad-hoc triggers don't spam the channel.
+  # The `slack_test` dispatch input skips the tests and notifies anyway, which is the only way to
+  # exercise this path without waiting for a real failure.
+  notify_on_failure:
+    name: Notify Slack on failure
+    needs: end_to_end_tests
+    if: always() && ((github.event_name == 'schedule' && needs.end_to_end_tests.result == 'failure') || (github.event_name == 'workflow_dispatch' && inputs.slack_test))
+    runs-on: ubuntu-latest
+    environment:
+      name: e2e-tests
+      deployment: false
+    permissions:
+      contents: read
+      actions: read
+
+    steps:
+      - name: Build Slack payload
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          WORKFLOW_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          HEADING: "${{ inputs.slack_test && ':white_circle: Slack alerting check, no tests were run' || ':red_circle: Scheduled e2e tests failed' }}"
+        run: |
+          # Retry the API call to tolerate transient 5xx from GitHub. The matrix nearly fills a
+          # single 100-item page, so paginate rather than silently count only the first one, and
+          # flatten the pages into the same shape a single page has. A response that is empty or
+          # not shaped as expected counts as a failed attempt as well, so that it falls back
+          # instead of aborting the step.
+          max_attempts=5
+          fetched=0
+          for attempt in $(seq 1 "${max_attempts}"); do
+            if gh api --paginate --slurp \
+              "repos/${REPO}/actions/runs/${RUN_ID}/attempts/${RUN_ATTEMPT}/jobs?per_page=100" > pages.json \
+              && jq '{jobs: [.[].jobs[]]}' pages.json > jobs.json \
+              && jq -e '.jobs | length > 0 and all(.[]; type == "object")' jobs.json > /dev/null; then
+              fetched=1
+              break
+            fi
+            if [[ "${attempt}" -lt "${max_attempts}" ]]; then
+              sleep "$((attempt * 5))"
+            fi
+          done
+
+          if [[ "${fetched}" -eq 0 ]]; then
+            echo "Failed to fetch job list after ${max_attempts} attempts; sending notification without it." >&2
+            failed_jobs="(unable to fetch job list - see workflow run)"
+          else
+            # This job is still running and so carries no conclusion, which keeps it out of both
+            # counts without having to match on its own name.
+            succeeded=$(jq '[.jobs[] | select(.conclusion == "success")] | length' jobs.json)
+            failed=$(jq '[.jobs[] | select(.conclusion == "failure")] | length' jobs.json)
+            bullets=$(jq -r '[.jobs[] | select(.conclusion == "failure") | "- \(.name)"] | join("\n")' jobs.json)
+
+            # Slack rejects the whole message with `invalid_blocks` once a section's text passes
+            # 3000 characters, which a full matrix failure comfortably does. Cut the list to fit,
+            # drop the partial line the cut leaves behind, and count off the remainder instead,
+            # leaving room for the count line and the trailing summary.
+            max_list_chars=2500
+            if [[ "${#bullets}" -gt "${max_list_chars}" ]]; then
+              bullets="${bullets:0:${max_list_chars}}"
+              bullets="${bullets%$'\n'*}"
+              # The list carries one newline fewer than it has lines, so stripping everything but
+              # the newlines counts what is left.
+              newlines="${bullets//[!$'\n']/}"
+              shown=$((${#newlines} + 1))
+              bullets="${bullets}"$'\n'"... and $((failed - shown)) more"
+            fi
+            failed_jobs="${failed} failed, ${succeeded} succeeded${bullets:+$'\n'}${bullets}"
+          fi
+
+          jq -n \
+            --arg repo "${REPO}" \
+            --arg url "${WORKFLOW_URL}" \
+            --arg heading "${HEADING}" \
+            --arg failed "${failed_jobs}" \
+            '{
+              text: "\($heading) in \($repo)",
+              blocks: [
+                {
+                  type: "header",
+                  text: { type: "plain_text", text: $heading, emoji: true }
+                },
+                {
+                  type: "section",
+                  fields: [
+                    { type: "mrkdwn", text: "*Repository:*\n\($repo)" },
+                    { type: "mrkdwn", text: "*Workflow run:*\n<\($url)|View on GitHub>" }
+                  ]
+                },
+                {
+                  type: "section",
+                  text: { type: "mrkdwn", text: "*Failed jobs:*\n\($failed)" }
+                }
+              ]
+            }' > slack-payload.json
+
+      - name: Send Slack notification
+        uses: slackapi/slack-github-action@v4.0.0
+        with:
+          # Without this the action swallows every delivery error into a hidden debug log line and
+          # reports success, so a rejected or undeliverable alert looks exactly like a sent one.
+          errors: true
+          webhook: ${{ secrets.SLACK_WEBHOOK_URL }}
+          webhook-type: incoming-webhook
+          payload-file-path: slack-payload.json

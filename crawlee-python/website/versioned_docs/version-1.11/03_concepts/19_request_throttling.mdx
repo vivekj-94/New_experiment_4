@@ -1,0 +1,78 @@
+---
+id: request-throttling
+title: Request throttling
+description: How to throttle requests per domain using the ThrottlingRequestManager.
+---
+
+import ApiLink from '@site/src/components/ApiLink';
+import RunnableCodeBlock from '@site/src/components/RunnableCodeBlock';
+
+import ThrottlingExample from '!!raw-loader!roa-loader!./code_examples/request_throttling/throttling_example.py';
+
+When crawling websites that enforce rate limits (HTTP 429) or specify `crawl-delay` in their `robots.txt`, you need a way to throttle requests per domain without blocking unrelated domains. The <ApiLink to="class/ThrottlingRequestManager">`ThrottlingRequestManager`</ApiLink> provides exactly this.
+
+## Overview
+
+The <ApiLink to="class/ThrottlingRequestManager">`ThrottlingRequestManager`</ApiLink> wraps a <ApiLink to="class/RequestManager">`RequestManager`</ApiLink> (typically a <ApiLink to="class/RequestQueue">`RequestQueue`</ApiLink>) and manages per-domain throttling. You specify which domains to throttle at initialization, and the manager automatically:
+
+- **Routes requests** for listed domains into dedicated sub-managers at insertion time.
+- **Enforces delays** from HTTP 429 responses (exponential backoff) and `robots.txt` crawl-delay directives.
+- **Schedules fairly** by fetching from the domain that has been waiting the longest.
+- **Releases the concurrency slot** when all configured domains are throttled, instead of holding it for the whole cooldown.
+
+Requests for domains **not** in the configured list pass through to the main queue without any throttling.
+
+## Basic usage
+
+To use request throttling, create a <ApiLink to="class/ThrottlingRequestManager">`ThrottlingRequestManager`</ApiLink> with the domains you want to throttle and pass it as the `request_manager` to your crawler:
+
+<RunnableCodeBlock className="language-python" language="python">
+    {ThrottlingExample}
+</RunnableCodeBlock>
+
+## How it works
+
+1. **Insertion-time routing**: When you add requests via `add_request` or `add_requests`, each request is checked against the configured domain list. Matching requests go directly into a per-domain sub-manager. All others go to the inner manager. Each request added this way lives in exactly one store, so it is deduplicated there. A request that reached the inner manager before its domain was configured moves into the domain's sub-manager if it's fetched during the domain's cooldown. Otherwise it's crawled from the inner manager.
+
+2. **429 backoff**: When the crawler detects an HTTP 429 response, the `ThrottlingRequestManager` records an exponential backoff delay for that domain (starting at 2s, doubling up to 60s). Requests already in flight when the limit was hit are treated as a single rate-limit event, so the delay doubles once per backoff window rather than once per 429. Once the domain goes a full extra window without rate-limiting, the next 429 starts the backoff over at the initial delay. If the response includes a `Retry-After` header with a positive delay, that value takes priority.
+
+3. **Crawl-delay**: If `robots.txt` specifies a `crawl-delay`, the manager enforces a minimum interval between requests to that domain.
+
+4. **Fair scheduling**: `fetch_next_request` sorts available sub-managers by how long each domain has been waiting, ensuring no domain is starved.
+
+5. **Cooldown handling**: While a domain is in a cooldown, its queued requests don't count as dispatchable, so the crawler's autoscaled pool idles instead of keeping a worker slot blocked. The requests still count towards completion, so the crawl waits for them and finishes only once every one has been handled. A domain that never stops rate-limiting doesn't keep the crawl running forever. For details, see [Persistent rate limiting](#persistent-rate-limiting).
+
+## Persistent rate limiting
+
+A 429 from a throttled domain doesn't fail the request. The request goes back to its queue and waits out the backoff, while the crawler keeps crawling other domains. The retry doesn't count towards `max_request_retries` or `max_session_rotations`, and the session isn't marked as bad. The 429 doesn't reach `error_handler` or `failed_request_handler`. Setting `ignore_http_error_status_codes={429}` doesn't pass the response to your request handler either, because the request is retried once the backoff ends.
+
+Some domains keep rate-limiting every request no matter how long the crawler waits. A domain that has done so for longer than the manager's `max_domain_stall` (15 minutes by default) counts as stalled. The crawler still finishes every other domain first, including domains waiting out a backoff or a crawl-delay. Once only stalled domains have requests left, `crawler.run()` raises <ApiLink to="class/PersistentRateLimitError">`PersistentRateLimitError`</ApiLink> instead of waiting forever. The error message names the stalled domains. To fix the stall, lower the crawler's concurrency or drop those domains.
+
+The requests of a stalled domain stay queued. To resume them, call `crawler.run()` again once `max_domain_stall` has passed since the domain's last 429, or start a new process with `purge_on_start` disabled.
+
+Note that:
+
+- A crawler running with `keep_alive=True` never raises the error. Instead, a stalled domain's requests don't make the crawler start new tasks until `max_domain_stall` has passed since the domain's last 429. A task started for other requests can still pick them up.
+- The stall clock survives a failed run. Rerunning in the same process within `max_domain_stall` of the last 429 raises the error again, before any request is sent if nothing else is queued. To reset the clock at once, create a new crawler with a new `ThrottlingRequestManager`.
+- A backoff or `Retry-After` delay longer than `max_domain_stall` delays detection until the domain's next 429.
+
+## Sub-manager storage
+
+Each configured domain gets its own sub-manager, opened through the `request_manager_opener` callback under the alias `throttled-<domain>`. All of them are opened the first time you use the manager, so a domain that never receives a request still gets an empty store.
+
+Opening the sub-managers up front also makes requests that a previous run left behind visible again. Whether they're resumed or discarded depends on <ApiLink to="class/Configuration#purge_on_start">`Configuration.purge_on_start`</ApiLink>:
+
+- With the default `purge_on_start=True`, the leftover requests are purged when the sub-manager opens, just like the requests in an unnamed inner queue.
+- With `purge_on_start=False`, the leftover requests are picked up and crawled.
+
+:::warning
+
+Named storages are exempt from `purge_on_start`, but aliased ones aren't. If you give the inner <ApiLink to="class/RequestQueue">`RequestQueue`</ApiLink> a `name` to make it persistent, the inner queue keeps its requests across a restart while the per-domain stores are still purged. To keep the requests in both, set `purge_on_start=False`.
+
+:::
+
+:::tip
+
+The `ThrottlingRequestManager` is an opt-in feature. If you don't pass it to your crawler, requests are processed normally without any per-domain throttling.
+
+:::

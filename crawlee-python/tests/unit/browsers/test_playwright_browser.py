@@ -1,0 +1,101 @@
+from __future__ import annotations
+
+import asyncio
+import logging
+import shutil
+from datetime import timedelta
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
+from unittest.mock import AsyncMock, Mock
+
+from crawlee.browsers._playwright_browser import PlaywrightPersistentBrowser
+
+if TYPE_CHECKING:
+    import pytest
+
+
+async def test_delete_temp_folder_when_files_are_locked(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The temp directory is removed even when the first delete attempts fail, as Windows locks the browser files."""
+    monkeypatch.setattr(PlaywrightPersistentBrowser, '_TMP_DIR_DELETE_INTERVAL', timedelta(0))
+
+    real_rmtree = shutil.rmtree
+    locked_attempts = 3
+    rmtree = Mock()
+
+    def rmtree_locked_at_first(path: Any, **kwargs: Any) -> None:
+        """Model `rmtree(ignore_errors=True)` silently leaving the directory in place while a file is locked."""
+        if rmtree.call_count > locked_attempts:
+            real_rmtree(path, **kwargs)
+
+    rmtree.side_effect = rmtree_locked_at_first
+    monkeypatch.setattr(shutil, 'rmtree', rmtree)
+
+    # A real browser on Windows can hold the files longer than the whole retry budget, so a fake context stands in.
+    # Like Playwright, it runs the `close` listener as a separate task. Letting that task start first makes `close` wait
+    # for the removal the listener is running.
+    context = Mock()
+    listener_tasks = list[asyncio.Task]()
+
+    async def close_context() -> None:
+        listener = context.on.call_args.args[1]
+        listener_tasks.append(asyncio.create_task(listener(context)))
+        await asyncio.sleep(0)
+
+    context.close = close_context
+    browser_type = Mock()
+    browser_type.launch_persistent_context = AsyncMock(return_value=context)
+
+    persist_browser = PlaywrightPersistentBrowser(browser_type, user_data_dir=None, browser_launch_options={})
+    await persist_browser.new_context()
+    assert isinstance(persist_browser._temp_dir, Path)
+    current_temp_dir = persist_browser._temp_dir
+    assert current_temp_dir.exists()
+    await persist_browser.close()
+    assert not current_temp_dir.exists()
+    await asyncio.gather(*listener_tasks)
+    # The context's `close` event retries the removal until it succeeds, then `close` runs it once more.
+    assert rmtree.call_count == locked_attempts + 2
+
+
+async def test_delete_temp_folder_recreated_after_close_event(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A temp directory the browser writes into after the context's `close` event is removed by `close`."""
+    monkeypatch.setattr(PlaywrightPersistentBrowser, '_TMP_DIR_DELETE_INTERVAL', timedelta(0))
+
+    # Playwright emits the `close` event while the browser process is still shutting down, so the fake context lets the
+    # listener finish its removal and then writes into the directory again before `close` returns.
+    context = Mock()
+
+    async def close_context() -> None:
+        listener = context.on.call_args.args[1]
+        await listener(context)
+        assert not current_temp_dir.exists()
+        current_temp_dir.mkdir()
+        (current_temp_dir / 'Local State').write_text('{}')
+
+    context.close = close_context
+    browser_type = Mock()
+    browser_type.launch_persistent_context = AsyncMock(return_value=context)
+
+    persist_browser = PlaywrightPersistentBrowser(browser_type, user_data_dir=None, browser_launch_options={})
+    await persist_browser.new_context()
+    assert isinstance(persist_browser._temp_dir, Path)
+    current_temp_dir = persist_browser._temp_dir
+    await persist_browser.close()
+    assert not current_temp_dir.exists()
+
+
+async def test_warn_when_temp_folder_cannot_be_deleted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A temp directory that stays locked for the whole retry budget is reported with a warning."""
+    monkeypatch.setattr(PlaywrightPersistentBrowser, '_TMP_DIR_DELETE_ATTEMPTS', 2)
+    monkeypatch.setattr(PlaywrightPersistentBrowser, '_TMP_DIR_DELETE_INTERVAL', timedelta(0))
+    monkeypatch.setattr(shutil, 'rmtree', Mock())
+
+    persist_browser = PlaywrightPersistentBrowser(Mock(), user_data_dir=None, browser_launch_options={})
+    persist_browser._temp_dir = tmp_path
+
+    with caplog.at_level(logging.WARNING, logger='crawlee.browsers._playwright_browser'):
+        await persist_browser._delete_temp_dir()
+
+    assert 'Could not remove the temporary user data directory' in caplog.text

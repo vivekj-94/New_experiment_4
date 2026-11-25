@@ -1,0 +1,139 @@
+name: Publish to NPM
+
+on:
+    workflow_call:
+        inputs:
+            ref:
+                description: Git ref to publish (branch, tag, or commit SHA)
+                required: true
+                type: string
+            dist-tag:
+                description: NPM dist-tag (prod, next or rc)
+                required: false
+                type: string
+                default: 'prod'
+    workflow_dispatch:
+        inputs:
+            ref:
+                description: Git ref to publish (branch, tag, or commit SHA)
+                required: true
+                type: string
+            dist-tag:
+                description: NPM dist-tag (prod, next or rc)
+                required: false
+                type: string
+                default: 'prod'
+
+concurrency:
+    group: publish-to-npm
+    cancel-in-progress: false
+
+permissions:
+    id-token: write # Required for OIDC
+    contents: write # Required to push updates
+
+jobs:
+    publish_to_npm:
+        name: Publish to NPM (${{ inputs.dist-tag }})
+        runs-on: ubuntu-26.04
+        environment:
+            name: npm
+            deployment: false
+        steps:
+            - uses: actions/checkout@v7.0.1
+              with:
+                  ref: ${{ inputs.ref }}
+                  token: ${{ secrets.APIFY_SERVICE_ACCOUNT_GITHUB_TOKEN }}
+                  fetch-depth: 0
+
+            - name: Check that the ref is on a release branch
+              env:
+                  GH_TOKEN: ${{ github.token }}
+              run: |
+                  sha=$(git rev-parse HEAD)
+                  branches=$(gh api --paginate "repos/$GITHUB_REPOSITORY/branches" --jq '.[].name' | grep -E '^(master|[0-9]+\.x)$')
+                  for branch in $branches; do
+                      status=$(gh api "repos/$GITHUB_REPOSITORY/compare/$branch...$sha" --jq .status || true)
+                      if [[ "$status" == "identical" || "$status" == "behind" ]]; then exit 0; fi
+                  done
+                  echo "::error::$sha is not on a release branch"
+                  exit 1
+
+            - name: Use Node.js 24
+              uses: actions/setup-node@v7.1.0
+              with:
+                  node-version: 24
+                  package-manager-cache: false
+
+            - name: Turbo cache
+              id: turbo-cache
+              uses: actions/cache@v6.1.0
+              with:
+                  path: .turbo
+                  key: turbo-${{ github.job }}-${{ github.ref_name }}-${{ github.sha }}
+                  restore-keys: |
+                      turbo-${{ github.job }}-${{ github.ref_name }}-
+
+            - uses: apify/actions/pnpm-install@v1.9.0
+
+            - name: Build packages
+              run: pnpm ci:build
+
+            - name: Bump canary versions
+              if: inputs.dist-tag != 'prod'
+              run: |
+                    pnpm turbo copy --force -- --canary=major --preid=${{ inputs.dist-tag == 'rc' && 'rc' || 'beta' }}
+
+            - name: Commit changes
+              if: inputs.dist-tag != 'prod'
+              uses: EndBug/add-and-commit@v11.1.1
+              id: commit
+              with:
+                author_name: Apify Release Bot
+                author_email: noreply@apify.com
+                message: "chore: bump ${{ inputs.dist-tag == 'rc' && 'RC' || 'canary' }} versions [skip ci]"
+                push: false
+
+            # Rekor outages last minutes; the sigstore patch (30s Rekor timeout + fetch the existing entry on 409) covers the per-call side
+            - name: Publish to NPM (@latest)
+              if: inputs.dist-tag == 'prod'
+              uses: nick-fields/retry@v4.0.0
+              with:
+                  timeout_minutes: 10
+                  max_attempts: 5
+                  retry_wait_seconds: 60
+                  command: git checkout . && pnpm publish:prod
+              env:
+                  GH_TOKEN: ${{ secrets.APIFY_SERVICE_ACCOUNT_GITHUB_TOKEN }}
+
+            - name: Publish to NPM (@next)
+              if: inputs.dist-tag != 'prod' && inputs.dist-tag != 'rc'
+              uses: nick-fields/retry@v4.0.0
+              with:
+                  timeout_minutes: 10
+                  max_attempts: 5
+                  retry_wait_seconds: 60
+                  command: git checkout . && pnpm publish:next
+              env:
+                  GH_TOKEN: ${{ secrets.APIFY_SERVICE_ACCOUNT_GITHUB_TOKEN }}
+
+            - name: Publish to NPM (@rc)
+              if: inputs.dist-tag == 'rc'
+              uses: nick-fields/retry@v4.0.0
+              with:
+                  timeout_minutes: 10
+                  max_attempts: 5
+                  retry_wait_seconds: 60
+                  command: git checkout . && pnpm publish:rc
+              env:
+                  GH_TOKEN: ${{ secrets.APIFY_SERVICE_ACCOUNT_GITHUB_TOKEN }}
+
+            # RC releases produce no changelog and no commit on the branch, only a git tag
+            # pointing at the released commit (the version bump lives only on npm).
+            - name: Create git tag
+              if: inputs.dist-tag == 'rc'
+              run: |
+                  VERSION=$(node -p "require('./packages/core/dist/package.json').version")
+                  git reset --hard HEAD~1
+                  git tag "v$VERSION"
+                  git push origin "refs/tags/v$VERSION"

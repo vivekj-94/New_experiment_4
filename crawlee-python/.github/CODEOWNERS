@@ -1,0 +1,5 @@
+# Documentation codeowner
+
+/docs/*.md @TC-MO
+/docs/*.mdx @TC-MO
+/.github/workflows/factory_review.yaml @mtrunkat

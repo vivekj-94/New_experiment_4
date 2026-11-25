@@ -1,0 +1,91 @@
+import type { Readable } from 'node:stream';
+
+import type { CookieJar } from './cookies.js';
+import type { ISession } from './session.js';
+import type { AllowedHttpMethods } from './utility-types.js';
+
+export type SearchParams = string | URLSearchParams | Record<string, string | number | boolean | null | undefined>;
+
+/**
+ * HTTP Request as accepted by {@apilink BaseHttpClient} methods.
+ */
+export interface HttpRequest {
+    url: string | URL;
+    method?: AllowedHttpMethods;
+    headers?: Headers;
+    body?: Readable;
+
+    signal?: AbortSignal;
+    timeout?: number;
+
+    cookieJar?: CookieJar;
+    /**
+     * Set to `false` to get the redirect response back instead of following it.
+     * @default true
+     */
+    followRedirect?: boolean;
+
+    proxyUrl?: string;
+}
+
+/**
+ * Additional options for HTTP requests that need to be handled separately before passing to {@apilink BaseHttpClient}.
+ */
+export interface HttpRequestOptions extends HttpRequest {
+    /** Search (query string) parameters to be appended to the request URL */
+    searchParams?: SearchParams;
+
+    /** A form to be sent in the HTTP request body (URL encoding will be used) */
+    form?: Record<string, string>;
+    /** Arbitrary object to be JSON-serialized and sent as the HTTP request body */
+    json?: unknown;
+
+    /** Basic HTTP Auth username */
+    username?: string;
+    /** Basic HTTP Auth password */
+    password?: string;
+}
+
+/**
+ * Request overrides accepted by the `sendRequest` context helper. Unlike {@apilink HttpRequestOptions}, headers may be any
+ * `HeadersInit` and the body may be a string or a `Buffer`.
+ */
+export type SendRequestOverrides = Omit<Partial<HttpRequestOptions>, 'headers' | 'body'> & {
+    headers?: HeadersInit;
+    body?: string | Buffer | Readable;
+};
+
+export interface SendRequestOptions {
+    session?: ISession;
+    cookieJar?: CookieJar;
+    /** Timeout for the HTTP request in milliseconds. */
+    timeoutMillis?: number;
+    /**
+     * An AbortSignal to cancel the HTTP request. When set, it replaces the HTTP client's default timeout, so pair it
+     * with `timeoutMillis` to keep the request bounded.
+     */
+    signal?: AbortSignal;
+    /**
+     * Overrides the proxy URL set in the `session` for this request.
+     *
+     * Note that setting this manually can interfere with session proxy rotation.
+     */
+    proxyUrl?: string;
+
+    /**
+     * When `true`, TLS certificate errors are ignored for this request. Also enabled by
+     * `session.proxyInfo.ignoreTlsErrors` (MITM proxies). Best-effort: clients that cannot
+     * disable TLS verification (e.g. the native fetch fallback) ignore it.
+     */
+    ignoreTlsErrors?: boolean;
+}
+
+/**
+ * Interface for user-defined HTTP clients to be used for plain HTTP crawling and for sending additional requests during a crawl.
+ */
+export interface BaseHttpClient {
+    /**
+     * Perform an HTTP Request and return the complete response.
+     */
+    sendRequest(request: Request, options?: SendRequestOptions): Promise<Response>;
+}

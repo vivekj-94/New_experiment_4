@@ -1,0 +1,554 @@
+from __future__ import annotations
+
+import asyncio
+import logging
+from datetime import timedelta
+from typing import TYPE_CHECKING
+from unittest.mock import AsyncMock, Mock
+
+import pytest
+from playwright.async_api import Page
+
+from crawlee.browsers import BrowserPool, PlaywrightBrowserController, PlaywrightBrowserPlugin
+from crawlee.browsers._browser_controller import BrowserController
+from crawlee.browsers._types import CrawleePage
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
+    from typing import Any
+
+    from playwright.async_api import BrowserContext
+    from yarl import URL
+
+    from crawlee.browsers._browser_plugin import BrowserPlugin
+    from crawlee.proxy_configuration import ProxyInfo
+
+
+async def test_default_plugin_new_page_creation(server_url: URL) -> None:
+    async with BrowserPool() as browser_pool:
+        page_1 = await browser_pool.new_page()
+        await page_1.page.goto(str(server_url))
+        assert page_1.browser_type == 'chromium'
+        assert page_1.page.url == str(server_url)
+        assert '<html' in await page_1.page.content()  # there is some HTML content
+        assert browser_pool.total_pages_count == 1
+
+        page_2 = await browser_pool.new_page()
+        await page_2.page.goto(str(server_url / 'status/200'))
+        assert page_2.browser_type == 'chromium'
+        assert page_2.page.url == str(server_url / 'status/200')
+        assert '<html' in await page_1.page.content()  # there is some HTML content
+        assert browser_pool.total_pages_count == 2
+
+        await page_1.page.close()
+        await page_2.page.close()
+
+
+@pytest.mark.run_alone
+async def test_multiple_plugins_new_page_creation(server_url: URL) -> None:
+    plugin_chromium = PlaywrightBrowserPlugin(browser_type='chromium')
+    plugin_firefox = PlaywrightBrowserPlugin(browser_type='firefox')
+
+    async with BrowserPool([plugin_chromium, plugin_firefox]) as browser_pool:
+        assert browser_pool.plugins == [plugin_chromium, plugin_firefox]
+
+        page_1 = await browser_pool.new_page()
+        await page_1.page.goto(str(server_url))
+        assert page_1.browser_type == 'chromium'
+        assert page_1.page.url == str(server_url)
+        assert '<html' in await page_1.page.content()  # there is some HTML content
+
+        page_2 = await browser_pool.new_page()
+        await page_2.page.goto(str(server_url / 'headers'))
+        assert page_2.browser_type == 'firefox'
+        assert page_2.page.url == str(server_url / 'headers')
+        assert '<html' in await page_2.page.content()  # there is some HTML content
+
+        page_3 = await browser_pool.new_page()
+        await page_3.page.goto(str(server_url / 'user-agent'))
+        assert page_3.browser_type == 'chromium'
+        assert page_3.page.url == str(server_url / 'user-agent')
+        assert '<html' in await page_3.page.content()  # there is some HTML content
+
+        await page_1.page.close()
+        await page_2.page.close()
+        await page_3.page.close()
+
+        assert browser_pool.total_pages_count == 3
+
+
+@pytest.mark.run_alone
+async def test_new_page_with_each_plugin(server_url: URL) -> None:
+    plugin_chromium = PlaywrightBrowserPlugin(browser_type='chromium')
+    plugin_firefox = PlaywrightBrowserPlugin(browser_type='firefox')
+
+    # Launching Chromium and Firefox concurrently is resource-heavy and can exceed the default
+    # operation timeout on slow CI runners. Use a generous timeout to keep the test stable.
+    async with BrowserPool([plugin_chromium, plugin_firefox], operation_timeout=timedelta(seconds=180)) as browser_pool:
+        pages = await browser_pool.new_page_with_each_plugin()
+
+        assert len(pages) == 2
+
+        assert pages[0].browser_type == 'chromium'
+        assert pages[1].browser_type == 'firefox'
+
+        await pages[0].page.goto(str(server_url))
+        assert pages[0].page.url == str(server_url)
+        assert '<html' in await pages[0].page.content()  # there is some HTML content
+
+        await pages[1].page.goto(str(server_url / 'headers'))
+        assert pages[1].page.url == str(server_url / 'headers')
+        assert '<html' in await pages[1].page.content()
+
+        for page in pages:
+            await page.page.close()
+
+        assert browser_pool.total_pages_count == 2
+
+
+@pytest.mark.run_alone
+async def test_with_default_plugin_constructor(server_url: URL) -> None:
+    # Launching a real Firefox browser is resource-heavy and flakes under xdist parallelism (it can time out
+    # even with a generous operation timeout when several workers compete for the runner). Run it alone and
+    # keep a generous operation timeout so that Firefox has enough time to launch on slow CI.
+    async with BrowserPool.with_default_plugin(
+        headless=True,
+        browser_type='firefox',
+    ) as browser_pool:
+        assert len(browser_pool.plugins) == 1
+        assert isinstance(browser_pool.plugins[0], PlaywrightBrowserPlugin)
+
+        page = await browser_pool.new_page()
+        assert page.browser_type == 'firefox'
+
+        await page.page.goto(str(server_url))
+        assert page.page.url == str(server_url)
+        assert '<html' in await page.page.content()  # there is some HTML content
+
+        await page.page.close()
+        assert browser_pool.total_pages_count == 1
+
+
+async def test_new_page_with_existing_id() -> None:
+    async with BrowserPool() as browser_pool:
+        page_1 = await browser_pool.new_page()
+        with pytest.raises(ValueError, match=r'Page with ID: .* already exists.'):
+            await browser_pool.new_page(page_id=page_1.id)
+
+
+async def test_new_page_with_invalid_plugin() -> None:
+    plugin_1 = PlaywrightBrowserPlugin(browser_type='chromium')
+    plugin_2 = PlaywrightBrowserPlugin(browser_type='firefox')
+    async with BrowserPool([plugin_1]) as browser_pool:
+        with pytest.raises(ValueError, match=r'Provided browser_plugin is not one of the plugins used by BrowserPool.'):
+            await browser_pool.new_page(browser_plugin=plugin_2)
+
+
+@pytest.mark.flaky(
+    reruns=3,
+    reason='Test is flaky on Windows when Playwright hits net::ERR_NO_BUFFER_SPACE under xdist load.',
+)
+async def test_resource_management(server_url: URL) -> None:
+    playwright_plugin = PlaywrightBrowserPlugin(browser_type='chromium')
+
+    async with BrowserPool([playwright_plugin]) as browser_pool:
+        page = await browser_pool.new_page()
+        # Use a generous navigation timeout to avoid flakes on slow Windows CI runners.
+        await page.page.goto(str(server_url), timeout=60_000)
+        assert page.page.url == str(server_url)
+        assert '<html' in await page.page.content()  # there is some HTML content
+        assert browser_pool.total_pages_count == 1
+
+    # All pages should be closed in __aexit__
+    assert page.page.is_closed()
+
+
+async def test_reaper_does_not_close_browser_with_page_opening_in_flight(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The inactive-browser reaper leaves a browser alone while its `new_page` call is still in flight."""
+    opening_in_flight = asyncio.Event()
+    resume_opening = asyncio.Event()
+    original_create_context = PlaywrightBrowserController._create_browser_context
+
+    async def create_context_with_gated_first_page(
+        self: PlaywrightBrowserController, *args: Any, **kwargs: Any
+    ) -> BrowserContext:
+        context = await original_create_context(self, *args, **kwargs)
+        original_new_page = context.new_page
+
+        async def gated_new_page(*new_page_args: Any, **new_page_kwargs: Any) -> Page:
+            opening_in_flight.set()
+            await resume_opening.wait()
+            return await original_new_page(*new_page_args, **new_page_kwargs)
+
+        monkeypatch.setattr(context, 'new_page', gated_new_page)
+        return context
+
+    monkeypatch.setattr(PlaywrightBrowserController, '_create_browser_context', create_context_with_gated_first_page)
+
+    # Long reaper intervals so that only the manual calls below drive the reaping; a zero inactivity
+    # threshold makes the freshly launched browser eligible for it right away.
+    async with BrowserPool(
+        browser_inactive_threshold=timedelta(seconds=0),
+        identify_inactive_browsers_interval=timedelta(hours=1),
+        close_inactive_browsers_interval=timedelta(hours=1),
+    ) as browser_pool:
+        new_page_task = asyncio.create_task(browser_pool.new_page())
+        await asyncio.wait_for(opening_in_flight.wait(), timeout=60)
+
+        # Run one reaper cycle, exactly as the recurring tasks would, while the page opening is pending.
+        browser_pool._identify_inactive_browsers()
+        await browser_pool._close_inactive_browsers()
+
+        resume_opening.set()
+        page = await new_page_task
+
+        assert not page.page.is_closed()
+        assert browser_pool.total_pages_count == 1
+
+        await page.page.close()
+
+
+async def test_methods_raise_error_when_not_active() -> None:
+    plugin = PlaywrightBrowserPlugin()
+    browser_pool = BrowserPool([plugin])
+
+    assert browser_pool.active is False
+
+    with pytest.raises(RuntimeError, match=r'BrowserPool is not active.'):
+        await browser_pool.new_page()
+
+    with pytest.raises(RuntimeError, match=r'BrowserPool is not active.'):
+        await browser_pool.new_page_with_each_plugin()
+
+    with pytest.raises(RuntimeError, match=r'BrowserPool is already active.'):
+        async with browser_pool, browser_pool:
+            pass
+
+    async with browser_pool:
+        assert browser_pool.active is True
+
+
+async def test_with_plugin_contains_page_options(server_url: URL) -> None:
+    plugin = PlaywrightBrowserPlugin(browser_new_context_options={'user_agent': 'My Best User-Agent'})
+    async with BrowserPool(plugins=[plugin]) as browser_pool:
+        test_page = await browser_pool.new_page()
+        await test_page.page.goto(str(server_url / 'user-agent'))
+        assert 'My Best User-Agent' in await test_page.page.content()
+        await test_page.page.close()
+
+
+@pytest.mark.parametrize(
+    ('retire_after_page_count', 'expect_equal_browsers'),
+    [
+        pytest.param(2, True, id='Two pages opened in the same browser'),
+        pytest.param(1, False, id='Each page opened in a new browser.'),
+    ],
+)
+async def test_browser_pool_retire_browser_after_page_count(
+    retire_after_page_count: int, *, expect_equal_browsers: bool
+) -> None:
+    async with BrowserPool(retire_browser_after_page_count=retire_after_page_count) as browser_pool:
+        test_page = await browser_pool.new_page()
+        first_browser = test_page.page.context
+        await test_page.page.close()
+
+        test_page = await browser_pool.new_page()
+        second_browser = test_page.page.context
+
+        await test_page.page.close()
+
+        if expect_equal_browsers:
+            assert first_browser is second_browser
+        else:
+            assert first_browser is not second_browser
+
+
+async def test_pre_page_create_hook_is_called() -> None:
+    call_mock = AsyncMock()
+
+    async with BrowserPool() as browser_pool:
+
+        @browser_pool.pre_page_create_hook
+        async def hook(
+            page_id: str,
+            controller: BrowserController,
+            browser_new_context_options: dict[str, Any],
+            proxy_info: ProxyInfo | None,
+        ) -> None:
+            await call_mock(page_id, controller, browser_new_context_options, proxy_info)
+
+            browser_new_context_options['user_agent'] = 'Modified User-Agent'
+
+            assert len(controller.pages) == 0
+
+        test_page = await browser_pool.new_page()
+        user_agent = await test_page.page.evaluate('navigator.userAgent')
+
+        await test_page.page.close()
+
+    assert user_agent == 'Modified User-Agent'
+
+    call_mock.assert_awaited_once()
+    page_id, controller, _, proxy_info = call_mock.call_args[0]
+
+    assert isinstance(page_id, str)
+    assert test_page.id == page_id
+    assert isinstance(controller, BrowserController)
+    assert proxy_info is None
+
+
+async def test_post_page_create_hook_is_called() -> None:
+    call_mock = AsyncMock()
+
+    async with BrowserPool() as browser_pool:
+
+        @browser_pool.post_page_create_hook
+        async def hook(crawlee_page: CrawleePage, controller: BrowserController) -> None:
+            await call_mock(crawlee_page, controller)
+            await crawlee_page.page.evaluate('window.__hook_applied = true')
+
+            assert isinstance(crawlee_page, CrawleePage)
+
+            assert len(controller.pages) == 1
+
+        test_page = await browser_pool.new_page()
+
+        js_result = await test_page.page.evaluate('window.__hook_applied')
+
+        await test_page.page.close()
+
+    assert js_result is True
+
+    call_mock.assert_awaited_once()
+    crawlee_page, controller = call_mock.call_args[0]
+
+    assert test_page is crawlee_page
+    assert isinstance(controller, BrowserController)
+
+
+async def test_pre_page_close_hook() -> None:
+    call_mock = AsyncMock()
+
+    async with BrowserPool() as browser_pool:
+
+        @browser_pool.pre_page_close_hook
+        async def hook(crawlee_page: CrawleePage, controller: BrowserController) -> None:
+            await call_mock(crawlee_page, controller)
+
+            assert not crawlee_page.page.is_closed()
+            assert len(controller.pages) == 1
+
+        test_page = await browser_pool.new_page()
+        await test_page.page.close()
+
+    call_mock.assert_awaited_once()
+    assert test_page.page.is_closed()
+
+
+async def test_post_page_close_hook() -> None:
+    call_mock = AsyncMock()
+
+    async with BrowserPool() as browser_pool:
+
+        @browser_pool.post_page_close_hook
+        async def hook(page_id: str, controller: BrowserController) -> None:
+            await call_mock(page_id, controller)
+
+            assert len(controller.pages) == 0
+
+        test_page = await browser_pool.new_page()
+        await test_page.page.close()
+
+    page_id, controller = call_mock.call_args[0]
+
+    call_mock.assert_awaited_once()
+    assert test_page.id == page_id
+    assert isinstance(controller, BrowserController)
+
+
+async def test_page_close_that_never_finishes_releases_page(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A page whose close never finishes is released, its browser is retired, and the post close hooks still run."""
+    monkeypatch.setattr(BrowserPool, '_PAGE_CLOSE_TIMEOUT', timedelta(milliseconds=100))
+    monkeypatch.setattr(Page, 'close', AsyncMock(side_effect=asyncio.Event().wait))
+    post_hook = AsyncMock()
+
+    async with BrowserPool() as browser_pool:
+        browser_pool.post_page_close_hook(post_hook)
+        test_page = await browser_pool.new_page()
+        controller = browser_pool.active_browsers[0]
+
+        with caplog.at_level(logging.WARNING):
+            await asyncio.wait_for(test_page.page.close(), timeout=10)
+
+        assert f'Closing the page {test_page.id} did not finish' in caplog.text
+        post_hook.assert_awaited_once_with(test_page.id, controller)
+        assert controller.pages_count == 0
+        assert controller in browser_pool.inactive_browsers
+
+        # The page's own `close` event can still arrive later, when the browser is closed. It must be a no-op.
+        controller.register_page_closed(test_page.page)
+        assert controller.pages_count == 0
+
+
+async def test_slow_page_close_hooks_are_not_cancelled(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Page close hooks that outlast the close time limit finish, and the browser is not retired."""
+    monkeypatch.setattr(BrowserPool, '_PAGE_CLOSE_TIMEOUT', timedelta(seconds=1))
+    pre_hook_finished = Mock()
+    post_hook_finished = Mock()
+
+    async with BrowserPool() as browser_pool:
+
+        @browser_pool.pre_page_close_hook
+        async def pre_hook(_crawlee_page: CrawleePage, _controller: BrowserController) -> None:
+            await asyncio.sleep(1.2)
+            pre_hook_finished()
+
+        @browser_pool.post_page_close_hook
+        async def post_hook(_page_id: str, _controller: BrowserController) -> None:
+            await asyncio.sleep(1.2)
+            post_hook_finished()
+
+        test_page = await browser_pool.new_page()
+        controller = browser_pool.active_browsers[0]
+
+        await asyncio.wait_for(test_page.page.close(), timeout=10)
+
+        pre_hook_finished.assert_called_once()
+        post_hook_finished.assert_called_once()
+        assert test_page.page.is_closed()
+        assert controller.pages_count == 0
+        assert controller in browser_pool.active_browsers
+
+
+async def test_hooks_execution_order() -> None:
+    call_order: list[str] = []
+
+    async with BrowserPool() as browser_pool:
+
+        @browser_pool.pre_launch_hook
+        async def pre_launch(_page_id: str, _plugin: BrowserPlugin) -> None:
+            call_order.append('pre_launch')
+
+        @browser_pool.post_launch_hook
+        async def post_launch(_page_id: str, _controller: BrowserController) -> None:
+            call_order.append('post_launch')
+
+        @browser_pool.pre_page_create_hook
+        async def pre_create(
+            _page_id: str,
+            _controller: BrowserController,
+            _browser_new_context_options: Mapping[str, Any],
+            _proxy_info: ProxyInfo | None,
+        ) -> None:
+            call_order.append('pre_create')
+
+        @browser_pool.post_page_create_hook
+        async def post_create(_crawlee_page: CrawleePage, _controller: BrowserController) -> None:
+            call_order.append('post_create')
+
+        @browser_pool.pre_page_close_hook
+        async def pre_close(_crawlee_page: CrawleePage, _controller: BrowserController) -> None:
+            call_order.append('pre_close')
+
+        @browser_pool.post_page_close_hook
+        async def post_close(_page_id: str, _controller: BrowserController) -> None:
+            call_order.append('post_close')
+
+        page = await browser_pool.new_page()
+        await page.page.close()
+
+    assert call_order == ['pre_launch', 'post_launch', 'pre_create', 'post_create', 'pre_close', 'post_close']
+
+
+async def test_multiple_hooks_all_called() -> None:
+    call_order: list[str] = []
+
+    async with BrowserPool() as browser_pool:
+
+        @browser_pool.post_page_create_hook
+        async def first(_crawlee_page: CrawleePage, _controller: BrowserController) -> None:
+            call_order.append('first')
+
+        @browser_pool.post_page_create_hook
+        async def second(_crawlee_page: CrawleePage, _controller: BrowserController) -> None:
+            call_order.append('second')
+
+        page = await browser_pool.new_page()
+        await page.page.close()
+
+    assert call_order == ['first', 'second']
+
+
+async def test_pre_launch_hook_is_called() -> None:
+    call_mock = AsyncMock()
+
+    async with BrowserPool() as browser_pool:
+
+        @browser_pool.pre_launch_hook
+        async def hook(page_id: str, plugin: BrowserPlugin) -> None:
+            await call_mock(page_id, plugin)
+
+        test_page = await browser_pool.new_page()
+        await test_page.page.close()
+
+    call_mock.assert_awaited_once()
+    page_id, plugin = call_mock.call_args[0]
+
+    assert isinstance(page_id, str)
+    assert test_page.id == page_id
+    assert isinstance(plugin, PlaywrightBrowserPlugin)
+
+
+async def test_post_launch_hook_is_called() -> None:
+    call_mock = AsyncMock()
+
+    async with BrowserPool() as browser_pool:
+
+        @browser_pool.post_launch_hook
+        async def hook(page_id: str, controller: BrowserController) -> None:
+            await call_mock(page_id, controller)
+
+        test_page = await browser_pool.new_page()
+        await test_page.page.close()
+
+    call_mock.assert_awaited_once()
+    page_id, controller = call_mock.call_args[0]
+
+    assert isinstance(page_id, str)
+    assert test_page.id == page_id
+    assert isinstance(controller, BrowserController)
+
+
+async def test_post_launch_hook_error_closes_browser() -> None:
+    async with BrowserPool() as browser_pool:
+
+        @browser_pool.post_launch_hook
+        async def hook(_page_id: str, _controller: BrowserController) -> None:
+            raise ValueError('Hook failed')
+
+        with pytest.raises(ValueError, match='Hook failed'):
+            await browser_pool.new_page()
+
+        assert len(browser_pool.active_browsers) == 0
+        assert len(browser_pool.inactive_browsers) == 0
+
+
+async def test_launch_hooks_not_called_for_existing_browser() -> None:
+    launch_hook_calls = 0
+
+    async with BrowserPool() as browser_pool:
+
+        @browser_pool.pre_launch_hook
+        async def hook(_page_id: str, _plugin: BrowserPlugin) -> None:
+            nonlocal launch_hook_calls
+            launch_hook_calls += 1
+
+        page_1 = await browser_pool.new_page()
+        page_2 = await browser_pool.new_page()
+
+        await page_1.page.close()
+        await page_2.page.close()
+
+    assert launch_hook_calls == 1

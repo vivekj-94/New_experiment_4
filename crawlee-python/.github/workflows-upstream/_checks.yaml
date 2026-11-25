@@ -1,0 +1,274 @@
+name: Checks
+
+on:
+  # Runs when invoked by another workflow. For manual runs, dispatch `CI (master)` instead — that wraps this
+  # workflow via `uses:`, so the resulting check-run names get the `Checks /` prefix that the manual release
+  # workflows look for via `wait-for-checks`.
+  workflow_call:
+    inputs:
+      run_tests:
+        description: Whether to run the unit and integration test suites.
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+env:
+  NODE_VERSION: 24
+
+jobs:
+  actions_lint_check:
+    name: Actions lint check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7.0.1
+      - name: Run actionlint
+        uses: rhysd/actionlint@v1.7.12
+
+  spell_check:
+    name: Spell check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7.0.1
+      - name: Check spelling with typos
+        uses: crate-ci/typos@v1.52.2
+
+  # The job names keep the `<caller> / <job>` shape of the reusable workflows they replace, which the rulesets require.
+  lint_check:
+    name: Lint check / Lint check (${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14", "3.15"]
+    steps:
+      - uses: apify/actions/python-lint-check@v1.9.0
+        with:
+          python-version: ${{ matrix.python-version }}
+
+  type_check:
+    name: Type check / Type check (${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14", "3.15"]
+    steps:
+      - uses: apify/actions/python-type-check@v1.9.0
+        with:
+          python-version: ${{ matrix.python-version }}
+
+  markdown_lint_check:
+    name: Markdown lint check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7.0.1
+
+      - name: Set up Node
+        uses: actions/setup-node@v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install pnpm and website dependencies
+        uses: apify/actions/pnpm-install@v1.9.0
+        with:
+          working-directory: website
+
+      - name: Lint Markdown
+        run: pnpm lint:md
+        working-directory: website
+
+  website_lint_check:
+    name: Website lint check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7.0.1
+
+      - name: Set up Node
+        uses: actions/setup-node@v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install pnpm and website dependencies
+        uses: apify/actions/pnpm-install@v1.9.0
+        with:
+          working-directory: website
+
+      - name: Lint website code
+        run: pnpm lint:code
+        working-directory: website
+
+      - name: Check website formatting
+        run: pnpm format:check
+        working-directory: website
+
+  image_lint_check:
+    name: Image lint check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0
+
+      # Doc images must be committed as optimized `.webp`. This fails when a PR adds raster
+      # images in another format so they get converted via `pnpm opt:images` first.
+      - name: Get changed unoptimized images
+        id: changed-files
+        uses: tj-actions/changed-files@v47.0.6
+        with:
+          files: |
+            docs/**/*.{png,jpg,jpeg,gif,bmp,tif,tiff,avif}
+            website/static/**/*.{png,jpg,jpeg,gif,bmp,tif,tiff,avif}
+          separator: "\n"
+
+      - name: Fail on unoptimized images
+        if: steps.changed-files.outputs.any_changed == 'true'
+        env:
+          UNOPTIMIZED_IMAGE_FILES: ${{ steps.changed-files.outputs.all_changed_files }}
+        run: |
+          echo "Unoptimized images detected! Convert each one to WebP, e.g.:"
+          echo ""
+          while IFS= read -r file_path; do
+            echo "  (cd website && pnpm opt:images \"../$file_path\")"
+          done <<< "$UNOPTIMIZED_IMAGE_FILES"
+          echo ""
+          echo "Then reference the resulting .webp files in your Markdown."
+          exit 1
+
+  unit_tests:
+    name: Unit tests / Unit tests (${{ matrix.os }}, ${{ matrix.python-version }})
+    if: inputs.run_tests
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ["ubuntu-latest", "windows-latest", "macos-latest"]
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14", "3.15"]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: apify/actions/python-unit-tests@v1.9.0
+        with:
+          python-version: ${{ matrix.python-version }}
+          tests-concurrency: "8"
+          upload-coverage: ${{ matrix.os == 'ubuntu-latest' && matrix.python-version == '3.15' }}
+          codecov-token: ${{ secrets.CODECOV_TOKEN }}
+          apify-httpbin-token: ${{ secrets.APIFY_HTTPBIN_TOKEN }}
+
+  integration_tests:
+    name: Integration tests (${{ matrix.python-version }}, ${{ matrix.os }})
+    if: inputs.run_tests
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        # The oldest and newest supported Python; the unit tests cover every version in between.
+        python-version: ["3.10", "3.15"]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    env:
+      TESTS_CONCURRENCY: "8"
+      CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
+    steps:
+      - name: macOS cleanup
+        if: runner.os == 'macOS'
+        # Disable Spotlight indexing and stop background processes that drain CPU during the tests.
+        run: |
+          sudo mdutil -i off /
+          sudo killall Finder spindump ecosystemanalyticsd SystemUIServer NotificationCenter mds mds_stores mds_worker mdworker mdworker_shared || true
+
+      - name: Checkout repository
+        uses: actions/checkout@v7.0.1
+
+      # The default Windows temp dir is a network disk, about 5x slower at small files than RUNNER_TEMP.
+      - name: Use the runner's local disk for temp files
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          echo "TMP=$RUNNER_TEMP" >> "$GITHUB_ENV"
+          echo "TEMP=$RUNNER_TEMP" >> "$GITHUB_ENV"
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v7.1.0
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Set up uv package manager
+        uses: astral-sh/setup-uv@v10.4.0
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install Python dependencies
+        run: uv run poe install-dev
+
+      - name: Run integration tests
+        run: uv run poe integration-tests-cov
+
+      # Codecov merges this upload with the unit test one, so the reported coverage covers both suites.
+      - name: Upload integration test coverage
+        if: >-
+          ${{
+            matrix.os == 'ubuntu-latest' &&
+            matrix.python-version == '3.15' &&
+            env.CODECOV_TOKEN != ''
+          }}
+        uses: codecov/codecov-action@v7.1.1
+        with:
+          token: ${{ env.CODECOV_TOKEN }}
+          files: coverage-integration.xml
+          flags: integration
+
+  package_check:
+    name: Package check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7.0.1
+
+      - name: Set up uv package manager
+        uses: astral-sh/setup-uv@v10.4.0
+        with:
+          python-version: "3.14"
+
+      - name: Build sdist and wheel
+        run: uv run poe build
+
+      - name: Verify built package
+        uses: apify/actions/python-package-check@v1.9.0
+        with:
+          package_name: crawlee
+          dist_dir: dist
+          python_version: "3.14"
+          extras: all
+          smoke_code: |
+            from crawlee.crawlers import (
+                HttpCrawler, BeautifulSoupCrawler, ParselCrawler,
+                PlaywrightCrawler, AdaptivePlaywrightCrawler,
+            )
+            from crawlee.storages import Dataset, KeyValueStore, RequestQueue
+            from crawlee.http_clients import HttpxHttpClient, ImpitHttpClient
+            from crawlee import Request
+            HttpCrawler()
+            BeautifulSoupCrawler()
+            ParselCrawler()
+
+      # uv and pip >= 26 fall back to pre-releases when a package publishes nothing else; older pip does not,
+      # so a specifier like `>=0.54` on a beta-only package breaks `pip install 'crawlee[all]'` for its users.
+      - name: Resolve the `all` extra with pip < 26
+        run: |
+          uv venv --seed --python 3.14 .venv-pip
+          .venv-pip/bin/python -m pip install 'pip<26'
+          .venv-pip/bin/python -m pip install --dry-run "$(ls dist/*.whl)[all]"
+
+  doc_check:
+    name: Doc check / Docs check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: apify/actions/python-docs-check@v1.9.0
+        with:
+          apify-signing-token: ${{ secrets.APIFY_SIGNING_TOKEN }}

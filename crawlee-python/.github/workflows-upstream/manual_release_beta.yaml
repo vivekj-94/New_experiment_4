@@ -1,0 +1,92 @@
+name: Beta release
+
+on:
+  # Runs when manually triggered from the GitHub UI, or dispatched from `on_master.yaml`
+  # via the `apify/actions/execute-workflow` action for the automatic beta release on push to master.
+  workflow_dispatch:
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  wait_for_checks:
+    # Gate the release on the `Checks` workflow already succeeding on this commit (run by `on_master.yaml`).
+    name: Wait for required checks
+    runs-on: ubuntu-latest
+    permissions:
+      checks: read
+    steps:
+      - name: Wait for checks
+        uses: apify/actions/wait-for-checks@v1.9.0
+        with:
+          ref: ${{ github.sha }}
+          check-regexp: ^Checks
+
+  release_prepare:
+    name: Release prepare
+    needs: [wait_for_checks]
+    runs-on: ubuntu-latest
+    outputs:
+      version_number: ${{ steps.release_prepare.outputs.version_number }}
+      changelog_artifact_name: ${{ steps.release_prepare.outputs.changelog_artifact_name }}
+    steps:
+      - uses: apify/actions/git-cliff-release@v1.9.0
+        id: release_prepare
+        name: Release prepare
+        with:
+          release_type: prerelease
+          existing_changelog_path: CHANGELOG.md
+
+  changelog_update:
+    name: Changelog update
+    needs: [release_prepare]
+    runs-on: ubuntu-latest
+    environment:
+      name: automation
+      deployment: false
+    permissions:
+      contents: write
+    outputs:
+      changelog_commitish: ${{ steps.changelog_update.outputs.changelog-commitish }}
+    steps:
+      - name: Bump version and update changelog
+        id: changelog_update
+        uses: apify/actions/python-bump-and-update-changelog@v1.9.0
+        with:
+          version-number: ${{ needs.release_prepare.outputs.version_number }}
+          changelog-artifact-name: ${{ needs.release_prepare.outputs.changelog_artifact_name }}
+          apify-service-account-github-token: ${{ secrets.APIFY_SERVICE_ACCOUNT_GITHUB_TOKEN }}
+
+  # Publishing runs as a separate workflow run of `publish_to_pypi.yaml` (see the comment there).
+  pypi_publish:
+    name: PyPI publish
+    needs: [release_prepare, changelog_update]
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write # Required by execute-workflow.
+    steps:
+      - name: Dispatch PyPI publish workflow
+        uses: apify/actions/execute-workflow@v1.9.0
+        with:
+          workflow: publish_to_pypi.yaml
+          inputs: >
+            {
+              "version_number": "${{ needs.release_prepare.outputs.version_number }}",
+              "ref": "${{ needs.changelog_update.outputs.changelog_commitish }}",
+              "is_prerelease": "true"
+            }
+
+  doc_release_post_publish:
+    name: Doc release post publish
+    needs: [changelog_update, pypi_publish]
+    permissions:
+      contents: write
+      pages: write
+      id-token: write
+      checks: read
+    uses: ./.github/workflows/manual_release_docs.yaml
+    secrets: inherit
